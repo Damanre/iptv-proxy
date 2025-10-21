@@ -1,66 +1,46 @@
-import express from "express";
-import fetch from "node-fetch";
+import http from "http";
+import https from "https";
+import httpProxy from "http-proxy";
 
-const app = express();
-const PORT = process.env.PORT || 10000;
 const TARGET = process.env.TARGET || "http://45.158.254.11";
+const PORT = process.env.PORT || 10000;
 
-// Para requests grandes (listas, segmentos TS, etc.)
-app.use(express.raw({ type: "*/*", limit: "200mb" }));
+// Agentes keep-alive para no abrir sockets nuevos cada vez
+const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 100 });
+const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
-app.use(async (req, res) => {
-  try {
-    // Construimos la URL de destino, preservando path y querystring
-    const url = new URL(req.url, TARGET);
-
-    // Filtramos algunos headers que no conviene reenviar tal cual
-    const hopByHop = new Set([
-      "host",
-      "connection",
-      "keep-alive",
-      "proxy-authenticate",
-      "proxy-authorization",
-      "te",
-      "trailer",
-      "transfer-encoding",
-      "upgrade",
-      "content-length", // la calcula node-fetch si hace falta
-      "accept-encoding" // que el destino no nos responda comprimido raro
-    ]);
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (!hopByHop.has(k.toLowerCase())) headers[k] = v;
-    }
-
-    const response = await fetch(url.toString(), {
-      method: req.method,
-      headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body
-    });
-
-    // Pasamos status y headers relevantes al cliente
-    res.status(response.status);
-    response.headers.forEach((value, key) => {
-      if (!hopByHop.has(key.toLowerCase())) res.setHeader(key, value);
-    });
-
-    // Pipe del body (importante para m3u8/ts/tsv/etc.)
-    if (response.body) {
-      response.body.on("error", () => {
-        // Evita que Render marque fallo por socket roto
-        if (!res.headersSent) res.status(502);
-        try { res.end(); } catch {}
-      });
-      response.body.pipe(res);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    if (!res.headersSent) res.status(502).send("Proxy error hacia IPTV");
-    else try { res.end(); } catch {}
-  }
+const proxy = httpProxy.createProxyServer({
+  target: TARGET,
+  changeOrigin: true,
+  xfwd: true,
+  ws: true,
+  secure: false,
+  agent: TARGET.startsWith("https") ? agentHttps : agentHttp
 });
 
-app.listen(PORT, () => {
-  console.log(`Proxy IPTV escuchando en puerto ${PORT}, destino ${TARGET}`);
+// Opcional: cabecera para evitar buffering en proxies intermedios
+proxy.on("proxyRes", (proxyRes, req, res) => {
+  res.setHeader("X-Accel-Buffering", "no");
+});
+
+proxy.on("error", (err, req, res) => {
+  if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
+  res.end("Proxy error");
+});
+
+const server = http.createServer((req, res) => {
+  // endpoint de vida para Render
+  if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
+
+  // IMPORTANTÍSIMO: no usamos body parsers, ni buffers → stream puro
+  req.socket.setNoDelay(true);
+  proxy.web(req, res, { target: TARGET });
+});
+
+// Mantener conexiones vivas pero finitas
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+
+server.listen(PORT, () => {
+  console.log(`DIPETV proxy escuchando en ${PORT} → ${TARGET}`);
 });
