@@ -2,7 +2,7 @@ import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
 
-const TARGET = process.env.TARGET || "http://45.158.254.11";
+const TARGET = process.env.TARGET || "http://185.243.7.190";
 const PORT = process.env.PORT || 10000;
 
 // Agentes keep-alive para no abrir sockets nuevos cada vez
