@@ -3,7 +3,7 @@ import https from "https";
 import httpProxy from "http-proxy";
 
 const TARGET = "http://185.243.7.190";
-const PORT = process.env.PORT || 10000;
+const PORT = 10000;
 
 // Agentes keep-alive para no abrir sockets nuevos cada vez
 const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 100 });
