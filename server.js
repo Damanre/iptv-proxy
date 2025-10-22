@@ -1,4 +1,6 @@
-// server.js — Proxy IPTV con follow interno de 302 + Referer y split-tunnel
+// server.js — Proxy IPTV con follow interno de 302 + Referer (selfHandleResponse)
+// Ejecuta: node >=18
+
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
@@ -11,16 +13,18 @@ const PORT   = parseInt(process.env.PORT || "10000", 10);
 const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 200 });
 const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 200 });
 
+// MUY IMPORTANTE: selfHandleResponse=true para controlar lo que se manda al cliente
 const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
   xfwd: true,
   ws: true,
   secure: false,
-  agent: TARGET.startsWith("https") ? agentHttps : agentHttp
+  agent: TARGET.startsWith("https") ? agentHttps : agentHttp,
+  selfHandleResponse: true
 });
 
-// Sigue 3xx internamente (con Referer al primer salto) y vuelca al cliente
+// sigue (hasta 3) redirecciones de forma interna y vuelca el resultado al cliente
 function followAndPipe(finalUrl, req, res, hops = 0) {
   if (hops > 3) { try { res.writeHead(502).end("Too many redirects"); } catch {} return; }
 
@@ -31,10 +35,10 @@ function followAndPipe(finalUrl, req, res, hops = 0) {
   const headers = {
     ...req.headers,
     host: u.host,
-    referer: `${TARGET}${req.url}`, // clave para evitar 509 del segundo salto
+    referer: `${TARGET}${req.url}`,    // clave para evitar 509/anti-hotlink
     connection: "keep-alive",
   };
-  delete headers["accept-encoding"]; // evitar compresión sobre TS
+  delete headers["accept-encoding"];   // evitar compresión sobre TS
 
   const opts = {
     protocol: u.protocol,
@@ -47,17 +51,17 @@ function followAndPipe(finalUrl, req, res, hops = 0) {
   };
 
   const up = client.request(opts, (upRes) => {
-    // Si vuelve a redirigir, seguimos internamente
+    // encadena más redirecciones si aparecen
     if (upRes.statusCode >= 300 && upRes.statusCode < 400 && upRes.headers.location) {
       const next = new URL(upRes.headers.location, `${u.protocol}//${u.host}`).toString();
-      upRes.resume(); // tiramos el cuerpo del 3xx
+      upRes.resume();
       return followAndPipe(next, req, res, hops + 1);
     }
 
+    // respuesta final → copiar headers (sanear) y volcar cuerpo
     const hdrs = { ...upRes.headers };
-    delete hdrs["content-encoding"]; // streaming limpio
-    delete hdrs["location"];         // no exponer redirects al cliente
-
+    delete hdrs["content-encoding"];
+    delete hdrs["location"]; // nunca exponer redirecciones al cliente
     try { res.writeHead(upRes.statusCode || 200, hdrs); } catch {}
     upRes.on("data", (chunk) => { try { res.write(chunk); } catch {} });
     upRes.on("end",  () => { try { res.end(); } catch {} });
@@ -71,18 +75,26 @@ function followAndPipe(finalUrl, req, res, hops = 0) {
   up.end();
 }
 
-// Intercepta la respuesta del primer upstream
+// manejamos SIEMPRE la respuesta del primer upstream
 proxy.on("proxyRes", (proxyRes, req, res) => {
   try { res.setHeader("X-Accel-Buffering", "no"); } catch {}
 
   const code = proxyRes.statusCode || 0;
   const loc  = proxyRes.headers && proxyRes.headers.location;
+
   if (code >= 300 && code < 400 && loc) {
-    // seguimos internamente y no devolvemos 3xx al cliente
-    proxyRes.resume();
+    // 3xx del primer salto → seguir internamente y devolver 200/206 al cliente
+    proxyRes.resume(); // no enviar este 3xx al cliente
     const absolute = new URL(loc, TARGET).toString();
     return followAndPipe(absolute, req, res, 1);
   }
+
+  // caso normal (no redirección): reenvía headers+cuerpo al cliente
+  const hdrs = { ...proxyRes.headers };
+  // no toques Location aquí (no debería venir en 2xx)
+  try { res.writeHead(code || 200, hdrs); } catch {}
+  proxyRes.on("data", (chunk) => { try { res.write(chunk); } catch {} });
+  proxyRes.on("end",  () => { try { res.end(); } catch {} });
 });
 
 proxy.on("error", (_err, _req, res) => {
