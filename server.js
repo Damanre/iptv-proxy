@@ -1,4 +1,4 @@
-// server.js — DIPETV proxy estable con caché de API, límites por IP/usuario y limpieza garantizada
+// server.js — DIPETV proxy estable con caché de API, límites por IP/usuario y streaming manual en /live
 import http from "http";
 import https from "https";
 import { URL } from "url";
@@ -24,7 +24,7 @@ const agentHttps = new https.Agent(commonAgentOpts);
 const targetUrl  = new URL(TARGET);
 const upstreamIsHttps = targetUrl.protocol === "https:";
 
-// ======== Proxy para todo lo que no sea player_api ========
+// ======== Proxy para rutas NO streaming ========
 const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
@@ -36,17 +36,15 @@ const proxy = httpProxy.createProxyServer({
   proxyTimeout: REQUEST_TIMEOUT_MS // inactividad de datos desde upstream
 });
 
-// ======== Métricas básicas ========
+// ======== Métricas ========
 let currentConnections = 0;
 let totalConnections   = 0;
+const activeByUser = new Map(); // /live/{user}/{pass}/...
+const activeByIp   = new Map(); // por IP
 
-// Por-usuario activos en /live/{user}/{pass}/...
-const activeByUser = new Map();
-// Por-IP activos (X-Forwarded-For o remoteAddress)
-const activeByIp   = new Map();
-
-// ======== Caché muy simple para player_api.php ========
+// ======== Caché player_api.php ========
 const apiCache = new Map(); // key: req.url → { body: Buffer, status, headers, t }
+
 function apiCacheSet(key, value) {
   apiCache.set(key, value);
   if (apiCache.size > API_CACHE_MAX_ENTRIES) {
@@ -83,7 +81,7 @@ function buildUpstreamOptions(req) {
   const url = new URL(req.url, TARGET);
   const isLive = /^\/live\/[^/]+\/[^/]+\//.test(req.url);
 
-  // Muchos paneles IPTV filtran por User-Agent. Emulamos VLC sólo en /live/
+  // Emula VLC en /live/ (muchos paneles filtran por UA)
   const forcedUA = isLive ? "VLC/3.0.18 LibVLC/3.0.18" : (req.headers["user-agent"] || "Mozilla/5.0");
 
   const opts = {
@@ -99,7 +97,7 @@ function buildUpstreamOptions(req) {
       "user-agent": forcedUA,
       "x-forwarded-for": clientIp(req),
       "x-forwarded-proto": "https",
-      "accept-encoding": "identity" // evita compresión rara en .ts
+      "accept-encoding": "identity" // evita compresión en binarios .ts
     },
     agent: url.protocol === "https:" ? agentHttps : agentHttp,
     timeout: REQUEST_TIMEOUT_MS
@@ -139,7 +137,7 @@ const server = http.createServer((req, res) => {
     return res.end(body);
   }
 
-  // Límite global: mejor 503 que colgarse
+  // Límite global
   if (currentConnections >= MAX_CONCURRENT) {
     res.writeHead(503, { "Retry-After": "2", "Content-Type": "text/plain" });
     return res.end("Server busy, retry");
@@ -181,7 +179,7 @@ const server = http.createServer((req, res) => {
   req.socket.setTimeout(IDLE_SOCKET_MS, () => { try { req.destroy(); } catch {} });
   res.setTimeout(REQUEST_TIMEOUT_MS, () => { try { res.destroy(); } catch {} });
 
-  // Limpieza garantizada pase lo que pase
+  // Limpieza garantizada
   req.on("aborted", cleanup);
   req.on("close",   cleanup);
   req.on("error",   cleanup);
@@ -189,7 +187,7 @@ const server = http.createServer((req, res) => {
   res.on("close",   cleanup);
   res.on("error",   cleanup);
 
-  // ------------- Rama player_api: ir directo al upstream con caché -------------
+  // ------------- player_api.php: petición manual + caché -------------
   if (isApi(req)) {
     try { res.setHeader("X-Accel-Buffering", "no"); } catch {}
 
@@ -210,11 +208,9 @@ const server = http.createServer((req, res) => {
     const opts = buildUpstreamOptions(req);
     const client = opts.protocol === "https:" ? https : http;
     const upReq = client.request(opts, (upRes) => {
-      // Clonar cabeceras mínimas y enviar al cliente
       const headers = { ...upRes.headers };
       try { res.writeHead(upRes.statusCode || 200, headers); } catch {}
 
-      // Bufferizar hasta API_MAX_BYTES para cache
       let buf = Buffer.alloc(0);
       upRes.on("data", (chunk) => {
         try { res.write(chunk); } catch {}
@@ -224,7 +220,6 @@ const server = http.createServer((req, res) => {
       });
       upRes.on("end", () => {
         try { res.end(); } catch {}
-        // Guardar en caché
         try {
           apiCacheSet(req.url, {
             body: buf,
@@ -247,13 +242,58 @@ const server = http.createServer((req, res) => {
     });
 
     upReq.end(); // GET sin body
-    return; // fin rama API
+    return;
   }
 
-  // ------------- Resto de rutas → proxy streaming -------------
+  // ------------- /live/... : STREAMING MANUAL (sin http-proxy) -------------
+  const isLivePath = /^\/live\/[^/]+\/[^/]+\//.test(req.url);
+  if (isLivePath) {
+    const opts = buildUpstreamOptions(req);
+
+    // Propaga Range si el cliente lo envía (para tests parciales rápidos)
+    if (req.headers.range) {
+      opts.headers.range = req.headers.range;
+    }
+    // Cabeceras típicas “compatibles IPTV”
+    opts.headers["accept"] = "*/*";
+    opts.headers["referer"] = TARGET + "/";
+    opts.headers["accept-encoding"] = "identity";
+    // Limpia hop-by-hop que no deben ir al upstream
+    delete opts.headers["proxy-connection"];
+    delete opts.headers["transfer-encoding"];
+
+    const client = opts.protocol === "https:" ? https : http;
+    const upReq = client.request(opts, (upRes) => {
+      const headers = { ...upRes.headers };
+      try { res.writeHead(upRes.statusCode || 200, headers); } catch {}
+
+      upRes.on("data", (chunk) => {
+        try { res.write(chunk); } catch {}
+      });
+      upRes.on("end", () => {
+        try { res.end(); } catch {}
+        cleanup();
+      });
+    });
+
+    upReq.on("timeout", () => { try { upReq.destroy(new Error("upstream timeout")); } catch {} });
+    upReq.on("error", () => {
+      if (!res.headersSent) {
+        try { res.writeHead(502, { "Content-Type": "text/plain" }); } catch {}
+      }
+      try { res.end("Upstream error"); } catch {}
+      cleanup();
+    });
+
+    // Ignora body del cliente (GET normalmente no envía)
+    req.on("data", () => {});
+    req.on("end",  () => { try { upReq.end(); } catch {} });
+    return;
+  }
+
+  // ------------- Resto de rutas → proxy tradicional -------------
   try { proxy.web(req, res, { target: TARGET }); }
   catch (e) {
-    // Por si salta síncrono (raro), responder y limpiar
     if (!res.headersSent) {
       try { res.writeHead(502, { "Content-Type": "text/plain" }); } catch {}
     }
@@ -262,7 +302,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// Timeouts en servidor para evitar sockets zombi
+// Timeouts del servidor
 server.keepAliveTimeout = 60000;
 server.headersTimeout   = 65000;
 server.requestTimeout   = REQUEST_TIMEOUT_MS;
