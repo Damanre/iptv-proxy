@@ -1,19 +1,21 @@
-// server.js — DIPETV proxy estable con caché de API y limpieza garantizada
+// server.js — DIPETV proxy estable con caché de API, límites por IP/usuario y limpieza garantizada
 import http from "http";
 import https from "https";
 import { URL } from "url";
 import httpProxy from "http-proxy";
 
 // ======== Config por ENV (Render → Environment) ========
-const TARGET              = process.env.TARGET || "http://45.158.254.11";
-const PORT                = parseInt(process.env.PORT || "10000", 10);
-const MAX_CONCURRENT      = parseInt(process.env.MAX_CONCURRENT || "20", 10);  // conexiones totales permitidas
-const AGENT_MAX_SOCKETS   = parseInt(process.env.AGENT_MAX_SOCKETS || "16", 10);
-const REQUEST_TIMEOUT_MS  = parseInt(process.env.REQUEST_TIMEOUT_MS || "15000", 10);
-const IDLE_SOCKET_MS      = parseInt(process.env.IDLE_SOCKET_MS || "10000", 10);
-const PER_USER_MAX        = parseInt(process.env.PER_USER_MAX || "1", 10);     // 1 stream por usuario
-const API_TTL_MS          = parseInt(process.env.API_TTL_MS || "60000", 10);   // TTL caché player_api (ms)
-const API_MAX_BYTES       = parseInt(process.env.API_MAX_BYTES || (1024 * 1024).toString(), 10); // máx 1MB
+const TARGET                 = process.env.TARGET || "http://45.158.254.11";
+const PORT                   = parseInt(process.env.PORT || "10000", 10);
+const MAX_CONCURRENT         = parseInt(process.env.MAX_CONCURRENT || "60", 10);   // conexiones totales permitidas
+const AGENT_MAX_SOCKETS      = parseInt(process.env.AGENT_MAX_SOCKETS || "48", 10);
+const REQUEST_TIMEOUT_MS     = parseInt(process.env.REQUEST_TIMEOUT_MS || "45000", 10);
+const IDLE_SOCKET_MS         = parseInt(process.env.IDLE_SOCKET_MS || "45000", 10);
+const PER_USER_MAX           = parseInt(process.env.PER_USER_MAX || "1", 10);      // 1 stream por usuario
+const PER_IP_MAX             = parseInt(process.env.PER_IP_MAX || "2", 10);        // máx streams por IP
+const API_TTL_MS             = parseInt(process.env.API_TTL_MS || "60000", 10);    // TTL caché player_api (ms)
+const API_MAX_BYTES          = parseInt(process.env.API_MAX_BYTES || (1024 * 1024), 10); // máx 1MB
+const API_CACHE_MAX_ENTRIES  = parseInt(process.env.API_CACHE_MAX_ENTRIES || "200", 10); // tope entradas de caché
 
 // ======== Agentes keep-alive ========
 const commonAgentOpts = { keepAlive: true, maxSockets: AGENT_MAX_SOCKETS, maxFreeSockets: 10 };
@@ -27,11 +29,11 @@ const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
   xfwd: true,
-  ws: true,
+  ws: false,                 // si no hay websockets, mejor off
   secure: false,
   agent: upstreamIsHttps ? agentHttps : agentHttp,
-  timeout: REQUEST_TIMEOUT_MS,     // esperando cabeceras
-  proxyTimeout: REQUEST_TIMEOUT_MS // inactividad de datos
+  timeout: REQUEST_TIMEOUT_MS,     // esperando cabeceras del upstream
+  proxyTimeout: REQUEST_TIMEOUT_MS // inactividad de datos desde upstream
 });
 
 // ======== Métricas básicas ========
@@ -40,9 +42,26 @@ let totalConnections   = 0;
 
 // Por-usuario activos en /live/{user}/{pass}/...
 const activeByUser = new Map();
+// Por-IP activos (X-Forwarded-For o remoteAddress)
+const activeByIp   = new Map();
 
 // ======== Caché muy simple para player_api.php ========
 const apiCache = new Map(); // key: req.url → { body: Buffer, status, headers, t }
+function apiCacheSet(key, value) {
+  apiCache.set(key, value);
+  if (apiCache.size > API_CACHE_MAX_ENTRIES) {
+    // purga FIFO sencilla
+    const firstKey = apiCache.keys().next().value;
+    if (firstKey) apiCache.delete(firstKey);
+  }
+}
+// purga periódica por TTL
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of apiCache) {
+    if (now - v.t > API_TTL_MS) apiCache.delete(k);
+  }
+}, Math.max(30000, API_TTL_MS));
 
 // ======== Helpers ========
 function once(fn) {
@@ -52,9 +71,21 @@ function once(fn) {
 function isApi(req) {
   return req.method === "GET" && req.url.startsWith("/player_api.php?");
 }
+function clientIp(req) {
+  const h = req.headers["x-forwarded-for"];
+  return (h && String(h).split(",")[0].trim()) || req.socket.remoteAddress || "";
+}
+function inc(map, key){ map.set(key, (map.get(key)||0)+1); }
+function dec(map, key){ const v=(map.get(key)||1)-1; v<=0?map.delete(key):map.set(key,v); }
+
 function buildUpstreamOptions(req) {
   // Construye request al upstream conservando path+query
   const url = new URL(req.url, TARGET);
+  const isLive = /^\/live\/[^/]+\/[^/]+\//.test(req.url);
+
+  // Muchos paneles IPTV filtran por User-Agent. Emulamos VLC sólo en /live/
+  const forcedUA = isLive ? "VLC/3.0.18 LibVLC/3.0.18" : (req.headers["user-agent"] || "Mozilla/5.0");
+
   const opts = {
     protocol: url.protocol,
     hostname: url.hostname,
@@ -65,8 +96,10 @@ function buildUpstreamOptions(req) {
       ...req.headers,
       host: url.host,
       connection: "keep-alive",
-      "x-forwarded-for": req.socket.remoteAddress,
+      "user-agent": forcedUA,
+      "x-forwarded-for": clientIp(req),
       "x-forwarded-proto": "https",
+      "accept-encoding": "identity" // evita compresión rara en .ts
     },
     agent: url.protocol === "https:" ? agentHttps : agentHttp,
     timeout: REQUEST_TIMEOUT_MS
@@ -97,7 +130,10 @@ const server = http.createServer((req, res) => {
       rss_mb: Math.round(m.rss/1024/1024),
       heapUsed_mb: Math.round(m.heapUsed/1024/1024),
       currentConnections,
-      totalConnections
+      totalConnections,
+      perUser: Object.fromEntries(activeByUser),
+      perIp: Object.fromEntries(activeByIp),
+      cacheSize: apiCache.size
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(body);
@@ -109,17 +145,26 @@ const server = http.createServer((req, res) => {
     return res.end("Server busy, retry");
   }
 
-  // Límite por usuario solo en /live/{user}/{pass}/...
+  // Límite por usuario/IP sólo en /live/{user}/{pass}/...
   let userKey = null;
+  const ipKey = clientIp(req);
+
   const liveMatch = req.url.match(/^\/live\/([^/]+)\/([^/]+)\//);
   if (liveMatch) {
     userKey = liveMatch[1];
-    const now = activeByUser.get(userKey) || 0;
-    if (now >= PER_USER_MAX) {
+
+    const uNow = activeByUser.get(userKey) || 0;
+    if (uNow >= PER_USER_MAX) {
       res.writeHead(429, { "Retry-After": "1", "Content-Type": "text/plain" });
       return res.end("Too many streams for this user");
     }
-    activeByUser.set(userKey, now + 1);
+    const iNow = activeByIp.get(ipKey) || 0;
+    if (iNow >= PER_IP_MAX) {
+      res.writeHead(429, { "Retry-After": "1", "Content-Type": "text/plain" });
+      return res.end("Too many streams from this IP");
+    }
+    inc(activeByUser, userKey);
+    inc(activeByIp, ipKey);
   }
 
   // Contadores
@@ -127,10 +172,8 @@ const server = http.createServer((req, res) => {
   totalConnections++;
   const cleanup = once(() => {
     currentConnections = Math.max(0, currentConnections - 1);
-    if (userKey) {
-      const v = (activeByUser.get(userKey) || 1) - 1;
-      if (v <= 0) activeByUser.delete(userKey); else activeByUser.set(userKey, v);
-    }
+    if (userKey) dec(activeByUser, userKey);
+    if (ipKey)   dec(activeByIp, ipKey);
   });
 
   // Timeouts en sockets de entrada
@@ -183,7 +226,7 @@ const server = http.createServer((req, res) => {
         try { res.end(); } catch {}
         // Guardar en caché
         try {
-          apiCache.set(req.url, {
+          apiCacheSet(req.url, {
             body: buf,
             status: upRes.statusCode || 200,
             headers,
@@ -220,8 +263,8 @@ const server = http.createServer((req, res) => {
 });
 
 // Timeouts en servidor para evitar sockets zombi
-server.keepAliveTimeout = 10000;
-server.headersTimeout   = 12000;
+server.keepAliveTimeout = 60000;
+server.headersTimeout   = 65000;
 server.requestTimeout   = REQUEST_TIMEOUT_MS;
 
 server.on("connection", (socket) => {
@@ -229,5 +272,5 @@ server.on("connection", (socket) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`DIPETV proxy → ${TARGET} | PORT=${PORT} | MAX=${MAX_CONCURRENT} | AGENT=${AGENT_MAX_SOCKETS} | PER_USER_MAX=${PER_USER_MAX}`);
+  console.log(`DIPETV proxy → ${TARGET} | PORT=${PORT} | MAX=${MAX_CONCURRENT} | AGENT=${AGENT_MAX_SOCKETS} | PER_USER_MAX=${PER_USER_MAX} | PER_IP_MAX=${PER_IP_MAX}`);
 });
