@@ -1,4 +1,4 @@
-// server.js — follow-redirects en /live/** + idle + límites + métricas de conexiones
+// server.js — follow-redirects en /live/** + idle + per-user + métricas (/stats, /stats/active)
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
@@ -18,7 +18,7 @@ const PER_USER_MAX     = parseInt(process.env.PER_USER_MAX     || "2", 10);
 
 // Métricas / privacidad
 const MAX_ACTIVE_RETURN = parseInt(process.env.MAX_ACTIVE_RETURN || "200", 10);   // máximo elementos en /stats/active
-const HIDE_IPS          = (process.env.HIDE_IPS || "true").toLowerCase() !== "false"; // enmascarar IPs en /stats/active
+const HIDE_IPS          = (process.env.HIDE_IPS || "true").toLowerCase() !== "false"; // enmascarar IPs
 
 /* ====== Agentes ====== */
 const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
@@ -73,20 +73,11 @@ function buildOptsFromUrl(req, urlStr) {
     timeout: PROXY_TIMEOUT_MS
   };
 }
-function clientIp(req) {
-  const xf = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim();
-  const ip = xf || req.socket.remoteAddress || "";
+function maskIp(ip) {
+  if (!ip) return "";
   if (!HIDE_IPS) return ip;
-  // enmascarar: IPv4 aaaa.bbb.ccc.xxx / IPv6 recortado
-  if (ip.includes(".")) {
-    const p = ip.split(".");
-    if (p.length === 4) p[3] = "x";
-    return p.join(".");
-  }
-  if (ip.includes(":")) {
-    const p = ip.split(":");
-    return p.slice(0, 4).join(":") + "::";
-  }
+  if (ip.includes(".")) { const p = ip.split("."); if (p.length===4) p[3] = "x"; return p.join("."); }
+  if (ip.includes(":")) { const p = ip.split(":"); return p.slice(0,4).join(":") + "::"; }
   return ip;
 }
 
@@ -99,7 +90,7 @@ function startSession(req) {
   const id = ++reqIdSeq;
   const s = {
     id,
-    ip: clientIp(req),
+    ip: maskIp((req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.socket.remoteAddress || ""),
     path: req.url,
     user: parseUser(req.url),
     started_at: Date.now(),
@@ -115,7 +106,6 @@ function finishSession(id) {
   if (active.has(id)) active.delete(id);
   curConns = Math.max(0, curConns - 1);
 }
-function p(arr, q){ if(!arr.length) return 0; const a=[...arr].sort((x,y)=>x-y); return a[Math.floor((a.length-1)*q)]; }
 
 /* ====== Control de sesiones activas por usuario ====== */
 const activeByUser = new Map(); // user -> count
@@ -150,7 +140,6 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
   }, MAX_STREAM_MS);
 
   const cleanup = () => { clearInterval(idleTimer); clearTimeout(maxTimer); };
-
   res.on("close", cleanup);
   res.on("finish", cleanup);
   res.on("error", cleanup);
@@ -182,15 +171,16 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
       headers["x-upstream-status"] = String(sc);
       try { res.writeHead(sc, headers); } catch {}
 
+      // Pipe con contadores/tiempos
       upRes.on("data", (chunk) => {
-        lastClientWrite = Date.now();
-        session.last_write_at = lastClientWrite;
+        const now = Date.now();
+        lastClientWrite = now;
+        session.last_write_at = now;
         session.bytes += chunk.length;
         totalBytes += chunk.length;
         try {
           const ok = res.write(chunk);
           if (ok === false) {
-            // Si el cliente no drena en CLIENT_IDLE_MS, cerramos
             const t = setTimeout(() => {
               if (!res.writableEnded && !res.destroyed) {
                 try { res.destroy(new Error("client backpressure timeout")); } catch {}
@@ -223,7 +213,7 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
 
 /* ====== Servidor HTTP ====== */
 const server = http.createServer((req, res) => {
-  // Endpoints de control
+  // Endpoints de control / métricas
   if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
   if (req.url === "/version") { res.writeHead(200); return res.end("follow-redirects+idle+stats"); }
   if (req.url === "/stats") {
@@ -264,7 +254,6 @@ const server = http.createServer((req, res) => {
 
   // Arranca sesión para métricas
   const { id, s } = startSession(req);
-
   const endSession = () => finishSession(id);
   res.on("close", endSession);
   res.on("finish", endSession);
