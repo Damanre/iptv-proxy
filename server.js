@@ -1,6 +1,4 @@
-// server.js — Proxy IPTV con follow interno de 302 + Referer (selfHandleResponse)
-// Ejecuta: node >=18
-
+// server.js
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
@@ -9,108 +7,106 @@ import { URL } from "url";
 const TARGET = process.env.TARGET || "http://185.243.7.190";
 const PORT   = parseInt(process.env.PORT || "10000", 10);
 
-// Agentes keep-alive
-const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 200 });
-const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 200 });
+// === Agentes ===
+// 1) keep-alive para API y cosas ligeras
+const agentKeepHttp  = new http.Agent({  keepAlive: true,  maxSockets: 200, maxFreeSockets: 10, timeout: 15000 });
+const agentKeepHttps = new https.Agent({ keepAlive: true,  maxSockets: 200, maxFreeSockets: 10, timeout: 15000 });
+// 2) sin keep-alive para vídeo (TS/M3U8): una request = una conexión
+const agentNoKeepHttp  = new http.Agent({  keepAlive: false, maxSockets: 400, timeout: 15000 });
+const agentNoKeepHttps = new https.Agent({ keepAlive: false, maxSockets: 400, timeout: 15000 });
 
-// MUY IMPORTANTE: selfHandleResponse=true para controlar lo que se manda al cliente
+const upstreamIsHttps = TARGET.startsWith("https");
+const agentKeep    = upstreamIsHttps ? agentKeepHttps    : agentKeepHttp;
+const agentNoKeep  = upstreamIsHttps ? agentNoKeepHttps  : agentNoKeepHttp;
+
 const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
   xfwd: true,
-  ws: true,
+  ws: false,
   secure: false,
-  agent: TARGET.startsWith("https") ? agentHttps : agentHttp,
-  selfHandleResponse: true
+
+  // timeouts base (se pueden sobreescribir por-request)
+  timeout: 15000,       // esperar cabeceras del upstream
+  proxyTimeout: 15000   // inactividad de datos desde upstream
 });
 
-// sigue (hasta 3) redirecciones de forma interna y vuelca el resultado al cliente
-function followAndPipe(finalUrl, req, res, hops = 0) {
-  if (hops > 3) { try { res.writeHead(502).end("Too many redirects"); } catch {} return; }
-
-  const u = new URL(finalUrl);
-  const isHttps = u.protocol === "https:";
-  const client  = isHttps ? https : http;
-
-  const headers = {
-    ...req.headers,
-    host: u.host,
-    referer: `${TARGET}${req.url}`,    // clave para evitar 509/anti-hotlink
-    connection: "keep-alive",
-  };
-  delete headers["accept-encoding"];   // evitar compresión sobre TS
-
-  const opts = {
-    protocol: u.protocol,
-    hostname: u.hostname,
-    port: u.port || (isHttps ? 443 : 80),
-    method: "GET",
-    path: u.pathname + u.search,
-    headers,
-    agent: isHttps ? agentHttps : agentHttp,
-  };
-
-  const up = client.request(opts, (upRes) => {
-    // encadena más redirecciones si aparecen
-    if (upRes.statusCode >= 300 && upRes.statusCode < 400 && upRes.headers.location) {
-      const next = new URL(upRes.headers.location, `${u.protocol}//${u.host}`).toString();
-      upRes.resume();
-      return followAndPipe(next, req, res, hops + 1);
-    }
-
-    // respuesta final → copiar headers (sanear) y volcar cuerpo
-    const hdrs = { ...upRes.headers };
-    delete hdrs["content-encoding"];
-    delete hdrs["location"]; // nunca exponer redirecciones al cliente
-    try { res.writeHead(upRes.statusCode || 200, hdrs); } catch {}
-    upRes.on("data", (chunk) => { try { res.write(chunk); } catch {} });
-    upRes.on("end",  () => { try { res.end(); } catch {} });
-  });
-
-  up.on("error", () => {
-    if (!res.headersSent) { try { res.writeHead(502, {"Content-Type":"text/plain"}); } catch {} }
-    try { res.end("Upstream error"); } catch {}
-  });
-
-  up.end();
+// helper: decide si es vídeo
+function isVideoPath(p) {
+  return /\.m3u8(\?.*)?$/.test(p) || /\.ts(\?.*)?$/.test(p);
+}
+function isApiPath(p) {
+  return p.startsWith("/player_api.php");
 }
 
-// manejamos SIEMPRE la respuesta del primer upstream
-proxy.on("proxyRes", (proxyRes, req, res) => {
-  try { res.setHeader("X-Accel-Buffering", "no"); } catch {}
-
-  const code = proxyRes.statusCode || 0;
-  const loc  = proxyRes.headers && proxyRes.headers.location;
-
-  if (code >= 300 && code < 400 && loc) {
-    // 3xx del primer salto → seguir internamente y devolver 200/206 al cliente
-    proxyRes.resume(); // no enviar este 3xx al cliente
-    const absolute = new URL(loc, TARGET).toString();
-    return followAndPipe(absolute, req, res, 1);
+proxy.on("proxyReq", (proxyReq, req, res, options) => {
+  // Cabeceras útiles
+  proxyReq.setHeader("X-Accel-Buffering", "no");
+  if (isVideoPath(req.url)) {
+    // Para segmentos de vídeo pedimos cierre al upstream
+    proxyReq.setHeader("Connection", "close");
   }
-
-  // caso normal (no redirección): reenvía headers+cuerpo al cliente
-  const hdrs = { ...proxyRes.headers };
-  // no toques Location aquí (no debería venir en 2xx)
-  try { res.writeHead(code || 200, hdrs); } catch {}
-  proxyRes.on("data", (chunk) => { try { res.write(chunk); } catch {} });
-  proxyRes.on("end",  () => { try { res.end(); } catch {} });
 });
 
-proxy.on("error", (_err, _req, res) => {
-  if (!res.headersSent) { try { res.writeHead(502, { "Content-Type": "text/plain" }); } catch {} }
+proxy.on("proxyRes", (proxyRes, req, res) => {
+  // Evita buffering en cadenas intermedias y pide cierre al cliente en vídeo
+  res.setHeader("X-Accel-Buffering", "no");
+  if (isVideoPath(req.url)) {
+    res.setHeader("Connection", "close");
+    // si no hay datos durante 8s, corta respuesta al cliente
+    res.setTimeout(8000, () => { try { res.destroy(); } catch {} });
+  } else {
+    // API puede tolerar algo más
+    res.setTimeout(15000, () => { try { res.destroy(); } catch {} });
+  }
+});
+
+proxy.on("error", (err, req, res) => {
+  if (res && !res.headersSent) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+  }
   try { res.end("Proxy error"); } catch {}
+});
+
+// si el cliente se va, corta también el lado upstream
+proxy.on("start", (req, res) => {
+  req.on("aborted", () => { try { res.destroy(); } catch {} });
 });
 
 const server = http.createServer((req, res) => {
   if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
+
   req.socket.setNoDelay(true);
-  proxy.web(req, res, { target: TARGET });
+  // si el cliente se queda ocioso, corta rápido
+  req.socket.setTimeout(isVideoPath(req.url) ? 8000 : 15000, () => { try { req.destroy(); } catch {} });
+
+  // agente y timeouts por tipo de recurso
+  const opts = { target: TARGET };
+  if (isVideoPath(req.url)) {
+    opts.agent = agentNoKeep;
+    opts.timeout = 10000;
+    opts.proxyTimeout = 10000;
+  } else {
+    opts.agent = agentKeep;
+    opts.timeout = 15000;
+    opts.proxyTimeout = 15000;
+  }
+
+  try {
+    proxy.web(req, res, opts);
+  } catch {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end("Proxy error");
+  }
 });
 
-server.keepAliveTimeout = 65000;
-server.headersTimeout   = 70000;
+// timeouts de servidor → evita sockets zombi del lado cliente
+server.keepAliveTimeout = 5000;   // cuanto mantener keep-alive del cliente
+server.headersTimeout   = 12000;  // límite total de cabeceras
+server.requestTimeout   = 15000;  // request entera
 
 server.listen(PORT, () => {
-  console.log(`DIPETV proxy escuchando en ${PORT} → ${TARGET}`);
+  console.log(`IPTV proxy en :${PORT} → ${TARGET}`);
 });
