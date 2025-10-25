@@ -1,24 +1,34 @@
-// server.js — follow-redirects en /live/** + idle + per-user + métricas (/stats, /stats/active)
+// server.js — follow-redirects en /live/** + idle + per-user (+opcional skip tiny ranges) + métricas
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
 import { URL } from "url";
+import events from "events";
 
 /* ====== Config ====== */
 const TARGET = process.env.TARGET || "http://185.243.7.190";
 const PORT   = parseInt(process.env.PORT || "10000", 10);
 
 // Tiempos
-const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || "90000", 10);   // timeouts generales
-const CLIENT_IDLE_MS   = parseInt(process.env.CLIENT_IDLE_MS   || "20000", 10);   // sin enviar bytes al cliente -> cortar
-const MAX_STREAM_MS    = parseInt(process.env.MAX_STREAM_MS    || "14400000", 10);// 4h
+const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || "90000", 10);    // timeouts generales
+const CLIENT_IDLE_MS   = parseInt(process.env.CLIENT_IDLE_MS   || "20000", 10);    // sin enviar bytes al cliente -> cortar
+const MAX_STREAM_MS    = parseInt(process.env.MAX_STREAM_MS    || "14400000", 10); // 4h
 
-// Límite por usuario (si la URL es /live/{user}/{pass}/...)
+// Límite por usuario (URL /live/{user}/{pass}/...)
+// 0 = sin límite
 const PER_USER_MAX     = parseInt(process.env.PER_USER_MAX     || "2", 10);
 
+// (Opcional) No aplicar límite de usuario a rangos pequeños (tests tipo HLS)
+// SKIP_LIMIT_TINY_RANGE=true para activar. Umbral en bytes con TINY_RANGE_MAX_BYTES (def 2 MiB)
+const SKIP_LIMIT_TINY_RANGE   = (process.env.SKIP_LIMIT_TINY_RANGE || "false").toLowerCase() === "true";
+const TINY_RANGE_MAX_BYTES    = parseInt(process.env.TINY_RANGE_MAX_BYTES || String(2 * 1024 * 1024), 10);
+
 // Métricas / privacidad
-const MAX_ACTIVE_RETURN = parseInt(process.env.MAX_ACTIVE_RETURN || "200", 10);   // máximo elementos en /stats/active
+const MAX_ACTIVE_RETURN = parseInt(process.env.MAX_ACTIVE_RETURN || "200", 10); // máximo elementos en /stats/active
 const HIDE_IPS          = (process.env.HIDE_IPS || "true").toLowerCase() !== "false"; // enmascarar IPs
+
+/* ====== Listener limits (evitar MaxListenersExceededWarning) ====== */
+events.defaultMaxListeners = 0;
 
 /* ====== Agentes ====== */
 const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
@@ -38,8 +48,11 @@ const proxy = httpProxy.createProxyServer({
   proxyTimeout: PROXY_TIMEOUT_MS
 });
 
-proxy.on("proxyRes", (_pr, _req, res) => {
+proxy.on("proxyRes", (_pr, req, res) => {
   try { res.setHeader("X-Accel-Buffering", "no"); } catch {}
+  // también bajamos límites en objetos individuales
+  try { req.setMaxListeners(0); } catch {}
+  try { res.setMaxListeners(0); } catch {}
   res.setTimeout(PROXY_TIMEOUT_MS, () => { try { res.destroy(); } catch {} });
 });
 proxy.on("error", (_err, _req, res) => {
@@ -61,7 +74,7 @@ function buildOptsFromUrl(req, urlStr) {
   delete headers["x-forwarded-proto"];
   delete headers["x-real-ip"];
   headers["host"] = u.host;
-  headers["accept-encoding"] = "identity";
+  headers["accept-encoding"] = "identity"; // evita compresión que rompa rangos/TS
   return {
     protocol: u.protocol,
     hostname: u.hostname,
@@ -79,6 +92,14 @@ function maskIp(ip) {
   if (ip.includes(".")) { const p = ip.split("."); if (p.length===4) p[3] = "x"; return p.join("."); }
   if (ip.includes(":")) { const p = ip.split(":"); return p.slice(0,4).join(":") + "::"; }
   return ip;
+}
+function isTinyRange(req) {
+  const r = (req.headers.range || "").toString().trim();
+  const m = /^bytes=(\d+)-(\d+)$/.exec(r);
+  if (!m) return false;
+  const start = +m[1], end = +m[2];
+  const sz = (end - start + 1);
+  return Number.isFinite(sz) && sz > 0 && sz <= TINY_RANGE_MAX_BYTES;
 }
 
 /* ====== Métricas y sesiones activas ====== */
@@ -111,6 +132,7 @@ function finishSession(id) {
 const activeByUser = new Map(); // user -> count
 function incUser(user) {
   if (!user) return true;
+  if (PER_USER_MAX <= 0) return true; // 0 = sin límite
   const n = activeByUser.get(user) || 0;
   if (n >= PER_USER_MAX) return false;
   activeByUser.set(user, n + 1);
@@ -171,7 +193,7 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
       headers["x-upstream-status"] = String(sc);
       try { res.writeHead(sc, headers); } catch {}
 
-      // Pipe con contadores/tiempos
+      // Pipe con contadores/tiempos, con control de 'drain' SIN fugas
       upRes.on("data", (chunk) => {
         const now = Date.now();
         lastClientWrite = now;
@@ -181,12 +203,15 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
         try {
           const ok = res.write(chunk);
           if (ok === false) {
-            const t = setTimeout(() => {
-              if (!res.writableEnded && !res.destroyed) {
-                try { res.destroy(new Error("client backpressure timeout")); } catch {}
-              }
-            }, CLIENT_IDLE_MS);
-            res.once("drain", () => clearTimeout(t));
+            // sólo si no hay ya un listener 'drain' pendiente
+            if (res.listenerCount("drain") === 0) {
+              const t = setTimeout(() => {
+                if (!res.writableEnded && !res.destroyed) {
+                  try { res.destroy(new Error("client backpressure timeout")); } catch {}
+                }
+              }, CLIENT_IDLE_MS);
+              res.once("drain", () => clearTimeout(t));
+            }
           }
         } catch {}
       });
@@ -213,9 +238,13 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
 
 /* ====== Servidor HTTP ====== */
 const server = http.createServer((req, res) => {
+  // bajar límites por objeto
+  try { req.setMaxListeners(0); } catch {}
+  try { res.setMaxListeners(0); } catch {}
+
   // Endpoints de control / métricas
   if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
-  if (req.url === "/version") { res.writeHead(200); return res.end("follow-redirects+idle+stats"); }
+  if (req.url === "/version") { res.writeHead(200); return res.end("follow-redirects+idle+stats+listenersfix"); }
   if (req.url === "/stats") {
     const m = process.memoryUsage();
     const body = JSON.stringify({
@@ -261,13 +290,19 @@ const server = http.createServer((req, res) => {
 
   if (isLivePath(req.url)) {
     const user = s.user;
-    if (!incUser(user)) {
-      res.writeHead(429, { "Content-Type":"text/plain", "Retry-After":"2" });
-      res.end("Too many streams for this user");
-      return;
+
+    // ¿Saltamos límite si es tiny-range y está activado?
+    const skipLimit = SKIP_LIMIT_TINY_RANGE && isTinyRange(req);
+
+    if (!skipLimit) {
+      if (!incUser(user)) {
+        res.writeHead(429, { "Content-Type":"text/plain", "Retry-After":"2" });
+        res.end("Too many streams for this user");
+        return;
+      }
+      res.on("close", () => decUser(user));
+      res.on("finish", () => decUser(user));
     }
-    res.on("close", () => decUser(user));
-    res.on("finish", () => decUser(user));
 
     const upstreamUrl = new URL(req.url, TARGET).toString();
     return fetchFollow({ initialUrl: upstreamUrl, req, res, maxRedirects: 5, session: s });
@@ -281,6 +316,10 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout   = PROXY_TIMEOUT_MS;
 server.requestTimeout   = PROXY_TIMEOUT_MS;
 
+// Errores globales: sumar métricas y no tumbar proceso
+process.on("uncaughtException", (e) => { totalErrors++; console.error("uncaughtException", e?.message); });
+process.on("unhandledRejection", (e) => { totalErrors++; console.error("unhandledRejection", e); });
+
 server.listen(PORT, () => {
-  console.log(`Proxy en :${PORT} → ${TARGET} | features: follow-redirects(/live), idle, per-user, stats`);
+  console.log(`Proxy en :${PORT} → ${TARGET} | features: follow-redirects(/live), idle, per-user(skipTiny=${SKIP_LIMIT_TINY_RANGE}), stats`);
 });
