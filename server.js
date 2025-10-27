@@ -1,4 +1,4 @@
-// server.js — follow-redirects en /live/** + idle + per-user (opcional) + métricas
+// server.js — follow-redirects en /live/** + idle + per-user (opcional) + anti-stall + métricas
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
@@ -11,7 +11,7 @@ const PORT   = parseInt(process.env.PORT || "10000", 10);
 
 // Tiempos
 const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || "90000", 10);    // timeouts generales
-const CLIENT_IDLE_MS   = parseInt(process.env.CLIENT_IDLE_MS   || "20000", 10);    // sin enviar bytes al cliente -> cortar
+const CLIENT_IDLE_MS   = parseInt(process.env.CLIENT_IDLE_MS   || "20000", 10);    // sin bytes al cliente -> cortar
 const MAX_STREAM_MS    = parseInt(process.env.MAX_STREAM_MS    || "14400000", 10); // 4h
 
 // Límite por usuario (URL /live/{user}/{pass}/...)
@@ -19,20 +19,24 @@ const MAX_STREAM_MS    = parseInt(process.env.MAX_STREAM_MS    || "14400000", 10
 const PER_USER_MAX     = parseInt(process.env.PER_USER_MAX     || "2", 10);
 
 // (Opcional) No aplicar límite a rangos pequeños (tests HLS tipo .ts parciales)
-// Actívalo con: SKIP_LIMIT_TINY_RANGE=true  y umbral con TINY_RANGE_MAX_BYTES (def 2 MiB)
 const SKIP_LIMIT_TINY_RANGE = (process.env.SKIP_LIMIT_TINY_RANGE || "false").toLowerCase() === "true";
 const TINY_RANGE_MAX_BYTES  = parseInt(process.env.TINY_RANGE_MAX_BYTES || String(2 * 1024 * 1024), 10);
 
+// Anti-stall (opcional)
+const RECONNECT_ON_STALL = (process.env.RECONNECT_ON_STALL || "false").toLowerCase() === "true";
+const UPSTREAM_STALL_MS  = parseInt(process.env.UPSTREAM_STALL_MS || "4000", 10);  // 4s sin bytes = consideramos stall
+const UPSTREAM_STALL_MAX = parseInt(process.env.UPSTREAM_STALL_MAX || "3", 10);    // reintentos por stream
+
 // Métricas / privacidad
-const MAX_ACTIVE_RETURN = parseInt(process.env.MAX_ACTIVE_RETURN || "200", 10); // máximo elementos en /stats/active
-const HIDE_IPS          = (process.env.HIDE_IPS || "true").toLowerCase() !== "false"; // enmascarar IPs
+const MAX_ACTIVE_RETURN = parseInt(process.env.MAX_ACTIVE_RETURN || "200", 10);
+const HIDE_IPS          = (process.env.HIDE_IPS || "true").toLowerCase() !== "false";
 
 /* ====== Listener limits (evitar MaxListenersExceededWarning) ====== */
 events.defaultMaxListeners = 0;
 
 /* ====== Agentes ====== */
-const agentHttp  = new http.Agent({  keepAlive: true, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
-const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
+const agentHttp  = new http.Agent({  keepAlive: true, keepAliveMsecs: 10000, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
+const agentHttps = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 400, maxFreeSockets: 50, timeout: PROXY_TIMEOUT_MS });
 
 const upstreamIsHttps = TARGET.startsWith("https");
 
@@ -40,7 +44,7 @@ const upstreamIsHttps = TARGET.startsWith("https");
 const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
-  xfwd: false,          // NO enviar IP real al upstream
+  xfwd: false, // NO enviamos IP real al upstream
   ws: false,
   secure: false,
   agent: upstreamIsHttps ? agentHttps : agentHttp,
@@ -66,7 +70,6 @@ function parseUser(u) { const m = u.match(/^\/live\/([^/]+)\/([^/]+)\//); return
 function buildOptsFromUrl(req, urlStr) {
   const u = new URL(urlStr);
   const headers = { ...req.headers };
-  // limpiar cabeceras “forwarded” hacia el upstream
   delete headers["x-forwarded-for"];
   delete headers["x-forwarded-proto"];
   delete headers["x-real-ip"];
@@ -101,6 +104,7 @@ function isTinyRange(req) {
 
 /* ====== Métricas y sesiones activas ====== */
 let curConns = 0, totalConns = 0, totalBytes = 0, totalErrors = 0;
+let stallEvents = 0, stallReconnects = 0;
 let reqIdSeq = 0;
 const active = new Map(); // id -> session
 
@@ -129,7 +133,7 @@ function finishSession(id) {
 const activeByUser = new Map(); // user -> count
 function incUser(user) {
   if (!user) return true;
-  if (PER_USER_MAX <= 0) return true; // 0 = sin límite
+  if (PER_USER_MAX <= 0) return true;
   const n = activeByUser.get(user) || 0;
   if (n >= PER_USER_MAX) return false;
   activeByUser.set(user, n + 1);
@@ -141,9 +145,11 @@ function decUser(user) {
   if (n <= 0) activeByUser.delete(user); else activeByUser.set(user, n);
 }
 
-/* ====== Follow-redirects para /live/** con cortes por inactividad ====== */
+/* ====== Follow-redirects para /live/** + anti-stall ====== */
 function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
   let lastClientWrite = Date.now();
+  let lastUpstreamData = Date.now();
+  let reconnects = 0;
 
   // Si el cliente no recibe datos durante CLIENT_IDLE_MS, cortamos
   const idleTimer = setInterval(() => {
@@ -171,6 +177,7 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
 
     const client = opts.protocol === "https:" ? https : http;
     const upReq = client.request(opts, (upRes) => {
+      try { upRes.socket?.setNoDelay?.(true); } catch {}
       const sc = upRes.statusCode || 200;
       session.upstream_status = sc;
 
@@ -183,7 +190,7 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
         return go(next.toString(), left - 1);
       }
 
-      // Cabeceras finales hacia el cliente
+      // Cabeceras hacia el cliente
       const headers = { ...upRes.headers };
       if (!headers["content-type"]) headers["content-type"] = "video/mp2t";
       headers["accept-ranges"] = headers["accept-ranges"] || "bytes";
@@ -192,10 +199,30 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
       headers["x-upstream-status"] = String(sc);
       try { res.writeHead(sc, headers); } catch {}
 
-      // Pipe con contadores/tiempos y control de backpressure SIN fugas
+      // Vigilancia anti-stall
+      let stallCheck = null;
+      if (RECONNECT_ON_STALL) {
+        stallCheck = setInterval(() => {
+          if (res.writableEnded || res.destroyed) return;
+          const gap = Date.now() - lastUpstreamData;
+          if (gap > UPSTREAM_STALL_MS && reconnects < UPSTREAM_STALL_MAX) {
+            stallEvents++;
+            reconnects++;
+            try { upReq.destroy(new Error("upstream stall")); } catch {}
+            try { clearInterval(stallCheck); } catch {}
+            // Reintentamos misma URL (o la que toque si redirige)
+            setTimeout(() => {
+              stallReconnects++;
+              go(currentUrl, maxRedirects); // reabrimos
+            }, 50);
+          }
+        }, Math.min(1000, UPSTREAM_STALL_MS));
+      }
+
       upRes.on("data", (chunk) => {
         const now = Date.now();
         lastClientWrite = now;
+        lastUpstreamData = now;
         session.last_write_at = now;
         session.bytes += chunk.length;
         totalBytes += chunk.length;
@@ -221,7 +248,10 @@ function fetchFollow({ initialUrl, req, res, maxRedirects = 5, session }) {
         } catch {}
       });
 
-      upRes.on("end", () => { try { res.end(); } catch {} });
+      upRes.on("end", () => {
+        try { clearInterval(stallCheck); } catch {}
+        try { res.end(); } catch {}
+      });
     });
 
     upReq.on("timeout", () => { try { upReq.destroy(new Error("upstream timeout")); } catch {} });
@@ -246,9 +276,9 @@ const server = http.createServer((req, res) => {
   try { req.setMaxListeners(0); } catch {}
   try { res.setMaxListeners(0); } catch {}
 
-  // Endpoints de control / métricas
+  // Endpoints control / métricas
   if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
-  if (req.url === "/version") { res.writeHead(200); return res.end("follow-redirects+idle+stats+listenersfix2"); }
+  if (req.url === "/version") { res.writeHead(200); return res.end("follow-redirects+idle+stats+listenersfix2+antistall"); }
   if (req.url === "/stats") {
     const m = process.memoryUsage();
     const body = JSON.stringify({
@@ -256,8 +286,8 @@ const server = http.createServer((req, res) => {
       uptime_s: Math.round(process.uptime()),
       rss_mb: Math.round(m.rss/1024/1024),
       heapUsed_mb: Math.round(m.heapUsed/1024/1024),
-      curConns, totalConns, totalErrors,
-      totalBytes
+      curConns, totalConns, totalErrors, totalBytes,
+      stallEvents, stallReconnects
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(body);
@@ -285,7 +315,7 @@ const server = http.createServer((req, res) => {
   req.socket.setTimeout(PROXY_TIMEOUT_MS, () => { try { req.destroy(); } catch {} });
   try { res.setHeader("X-Accel-Buffering", "no"); } catch {}
 
-  // Arranca sesión para métricas
+  // Sesión para métricas
   const { id, s } = startSession(req);
   const endSession = () => finishSession(id);
   res.on("close", endSession);
@@ -318,10 +348,10 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout   = PROXY_TIMEOUT_MS;
 server.requestTimeout   = PROXY_TIMEOUT_MS;
 
-// Errores globales: sumar métricas y no tumbar proceso
+// Errores globales
 process.on("uncaughtException", (e) => { totalErrors++; console.error("uncaughtException", e?.message); });
 process.on("unhandledRejection", (e) => { totalErrors++; console.error("unhandledRejection", e); });
 
 server.listen(PORT, () => {
-  console.log(`Proxy en :${PORT} → ${TARGET} | features: follow-redirects(/live), idle, per-user(skipTiny=${SKIP_LIMIT_TINY_RANGE}), stats`);
+  console.log(`Proxy en :${PORT} → ${TARGET} | features: follow-redirects(/live), idle, per-user(skipTiny=${SKIP_LIMIT_TINY_RANGE}), anti-stall=${RECONNECT_ON_STALL}, stats`);
 });
